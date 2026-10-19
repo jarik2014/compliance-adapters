@@ -159,6 +159,70 @@ export class HorizonListener {
   // Soroban RPC's getEvents is a polling/cursor API, not a persistent stream, so
   // "reconnecting" here just means: pause, then poll again with backoff.
   /**
+   * Consumes events as an async iterator (#815).
+   *
+   * Callback-style `onEvent` does not compose with modern stream processing:
+   * `for await`, pipelines and `AbortSignal`. This method pulls on demand —
+   * a page is fetched only when the consumer asks for the next event, and the
+   * cursor advances only once a page is fully consumed — so a slow consumer
+   * applies backpressure instead of building an unbounded buffer.
+   *
+   * ```ts
+   * for await (const event of listener.events({ signal })) {
+   *   await handle(event);           // slow consumer → no extra polling
+   * }
+   * ```
+   *
+   * Breaking out of the loop (or aborting the signal) ends it cleanly: no
+   * further polls happen and the iterator returns. Do not run this alongside
+   * `start()` on the same instance — they would both advance the cursor.
+   */
+  async *events(options: { signal?: AbortSignal } = {}): AsyncIterableIterator<RawContractEvent> {
+    const signal = options.signal;
+    let cursor = this.cursor;
+    let page: { events: RawContractEvent[]; nextCursor: string; latestLedger?: number } | null = null;
+    let index = 0;
+
+    while (!signal?.aborted) {
+      if (page === null) {
+        page = await this.eventSource.getEvents(cursor);
+        index = 0;
+
+        if (page.events.length === 0) {
+          // Quiet period: hand the cursor over and wait before asking again.
+          cursor = page.nextCursor;
+          page = null;
+          await this.sleep(this.pollIntervalMs, signal);
+          continue;
+        }
+      }
+
+      if (index >= page.events.length) {
+        // Page fully consumed — only now is it safe to move past it.
+        cursor = page.nextCursor;
+        page = null;
+        continue;
+      }
+
+      const event = page.events[index];
+      index += 1;
+
+      // Account for the event before handing it over: the consumer receives a
+      // fully-delivered event, so lag never shows a value the consumer would
+      // contradict. Same rule as the callback path — only relayed ledgers count.
+      this.processedLedger = event.ledger;
+      if (typeof page.latestLedger === 'number') {
+        const lag = Math.max(0, page.latestLedger - this.processedLedger);
+        this.metrics.gauge.set('ledger_lag', lag);
+      }
+
+      yield event;
+    }
+
+    this.logger.debug('horizon-listener: events() iterator finished');
+  }
+
+  /**
    * Starts the event listener loop.
    * @throws {Error} When max retries are exceeded for consecutive polling failures.
    * This is an unrecoverable error that indicates the listener cannot continue.
