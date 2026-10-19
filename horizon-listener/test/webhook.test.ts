@@ -29,6 +29,70 @@ describe('HttpWebhookSender', () => {
     expect(JSON.parse(init.body)).toEqual({ event });
   });
 
+  it('sends custom headers on every delivery (#818)', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({
+      url: 'http://localhost:9999/webhook',
+      fetchImpl,
+      headers: { 'X-Api-Key': 'secret-key', 'X-Tenant-Id': 'clinic-42' },
+    });
+
+    await sender.send(makeEvent());
+
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers['X-Api-Key']).toBe('secret-key');
+    expect(init.headers['X-Tenant-Id']).toBe('clinic-42');
+  });
+
+  it('lets custom headers coexist with signing (#818)', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({
+      url: 'http://localhost:9999/webhook',
+      fetchImpl,
+      signingSecret: 'topsecret',
+      headers: { 'X-Api-Key': 'secret-key' },
+    });
+
+    await sender.send(makeEvent());
+
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers['X-Api-Key']).toBe('secret-key');
+    expect(init.headers['X-Signature']).toMatch(/^sha256=[0-9a-f]{64}$/);
+    expect(init.headers['X-Timestamp']).toBeTruthy();
+  });
+
+  it('never lets custom headers override reserved ones (#818)', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({
+      url: 'http://localhost:9999/webhook',
+      fetchImpl,
+      signingSecret: 'topsecret',
+      headers: {
+        'Content-Type': 'text/plain',
+        'X-Timestamp': '0',
+        'X-Signature': 'sha256=forged',
+      },
+    });
+
+    await sender.send(makeEvent());
+
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers['Content-Type']).toBe('application/json');
+    expect(init.headers['X-Timestamp']).not.toBe('0');
+    expect(init.headers['X-Signature']).not.toBe('sha256=forged');
+    expect(init.headers['X-Signature']).toMatch(/^sha256=[0-9a-f]{64}$/);
+  });
+
+  it('sends no custom headers when none are configured', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({ url: 'http://localhost:9999/webhook', fetchImpl });
+
+    await sender.send(makeEvent());
+
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(Object.keys(init.headers)).toEqual(['Content-Type']);
+  });
+
   it('throws when the response is not ok', async () => {
     const fetchImpl = jest.fn().mockResolvedValue({ ok: false, status: 500 });
     const sender = new HttpWebhookSender({ url: 'http://localhost:9999/webhook', fetchImpl });

@@ -201,6 +201,23 @@ backoff and `maxRetries` handling described below.
 
 ## Webhook signature verification
 
+### Custom headers
+
+Receivers behind an API gateway often need a static header (an API key, a tenant
+id). Pass it once:
+
+```ts
+const webhook = new HttpWebhookSender({
+  url: 'https://gateway.example.com/compliance',
+  signingSecret: process.env.WEBHOOK_SIGNING_SECRET,
+  headers: { 'X-Api-Key': process.env.GATEWAY_API_KEY! },
+});
+```
+
+The map is merged **under** the reserved headers: `Content-Type`,
+`Idempotency-Key`, `X-Timestamp` and `X-Signature` always win, so a custom entry
+can never break signing or idempotency.
+
 When `HttpWebhookSender` is constructed with a `signingSecret`, every outbound
 request carries an `X-Timestamp` header and an `X-Signature` header of the
 form:

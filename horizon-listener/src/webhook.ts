@@ -52,6 +52,15 @@ export interface HttpWebhookSenderOptions {
    * timestamp. See horizon-listener/README.md for the verification recipe.
    */
   signingSecret?: string;
+  /**
+   * Static headers sent with every delivery — API keys or tenant ids that a
+   * receiver behind a gateway requires (#818).
+   *
+   * These are merged *under* the reserved headers: `Content-Type`,
+   * `Idempotency-Key`, `X-Timestamp` and `X-Signature` always win, so a custom
+   * map can never break signing or idempotency.
+   */
+  headers?: Record<string, string>;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
   /**
@@ -83,6 +92,7 @@ export class HttpWebhookSender implements WebhookSender {
   private readonly url: string;
   private readonly signingSecret?: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly customHeaders: Record<string, string>;
   private readonly timeoutMs: number | undefined;
   private readonly maxRetries: number;
   private readonly metrics: AnyMetricsRegistry;
@@ -113,6 +123,7 @@ export class HttpWebhookSender implements WebhookSender {
     // Node 20+ ships a global fetch; fetchImpl is injectable so tests never
     // make a real network call.
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.customHeaders = { ...(options.headers ?? {}) };
     this.timeoutMs = options.timeoutMs;
     this.maxRetries = options.maxRetries ?? 3;
     this.metrics = options.metrics ?? new NoopMetricsRegistry();
@@ -127,7 +138,12 @@ export class HttpWebhookSender implements WebhookSender {
    */
   async send(event: RawContractEvent): Promise<void> {
     const body = JSON.stringify({ event });
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    // Custom headers first, reserved ones last: a receiver-specific map must not
+    // be able to overwrite the headers that make delivery verifiable (#818).
+    const headers: Record<string, string> = {
+      ...this.customHeaders,
+      'Content-Type': 'application/json',
+    };
 
     if (this.signingSecret) {
       const timestamp = Math.floor(Date.now() / 1000).toString();
