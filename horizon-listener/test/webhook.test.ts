@@ -25,8 +25,54 @@ describe('HttpWebhookSender', () => {
     const [url, init] = fetchImpl.mock.calls[0];
     expect(url).toBe('http://localhost:9999/webhook');
     expect(init.method).toBe('POST');
-    expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(init.headers).toEqual({
+      'Content-Type': 'application/json',
+      'Idempotency-Key': event.id,
+    });
     expect(JSON.parse(init.body)).toEqual({ event });
+  });
+
+  it('sends an Idempotency-Key derived from the event id (#810)', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({ url: 'http://localhost:9999/webhook', fetchImpl });
+
+    await sender.send(makeEvent({ id: 'evt-abc-123' }));
+
+    const [, init] = fetchImpl.mock.calls[0];
+    expect(init.headers['Idempotency-Key']).toBe('evt-abc-123');
+  });
+
+  it('keeps the same Idempotency-Key across retries of one delivery (#810)', async () => {
+    const fetchImpl = jest
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockResolvedValueOnce({ ok: false, status: 502 })
+      .mockResolvedValueOnce({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({
+      url: 'http://localhost:9999/webhook',
+      fetchImpl,
+      maxRetries: 3,
+    });
+
+    await sender.send(makeEvent({ id: 'evt-retry-key' }));
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    const keys = fetchImpl.mock.calls.map(([, init]) => init.headers['Idempotency-Key']);
+    // Identical on every attempt: that is the whole point — a receiver dedupes
+    // the retried POSTs of one event by this header.
+    expect(new Set(keys).size).toBe(1);
+    expect(keys[0]).toBe('evt-retry-key');
+  });
+
+  it('derives distinct keys for distinct events', async () => {
+    const fetchImpl = jest.fn().mockResolvedValue({ ok: true, status: 200 });
+    const sender = new HttpWebhookSender({ url: 'http://localhost:9999/webhook', fetchImpl });
+
+    await sender.send(makeEvent({ id: 'evt-1' }));
+    await sender.send(makeEvent({ id: 'evt-2' }));
+
+    const keys = fetchImpl.mock.calls.map(([, init]) => init.headers['Idempotency-Key']);
+    expect(keys).toEqual(['evt-1', 'evt-2']);
   });
 
   it('throws when the response is not ok', async () => {
@@ -43,7 +89,10 @@ describe('HttpWebhookSender', () => {
     await sender.send(makeEvent());
 
     const [, init] = fetchImpl.mock.calls[0];
-    expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
+    expect(init.headers).toEqual({
+      'Content-Type': 'application/json',
+      'Idempotency-Key': 'evt-1',
+    });
   });
 
   it('adds X-Timestamp and a correctly computed X-Signature header when a signing secret is configured', async () => {

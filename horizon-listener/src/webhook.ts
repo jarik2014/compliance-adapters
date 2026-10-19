@@ -127,7 +127,13 @@ export class HttpWebhookSender implements WebhookSender {
    */
   async send(event: RawContractEvent): Promise<void> {
     const body = JSON.stringify({ event });
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      // Stable per event and set once, outside the retry loop, so every attempt
+      // of the same delivery carries the same key and receivers can deduplicate
+      // a retried POST (#810).
+      'Idempotency-Key': event.id,
+    };
 
     if (this.signingSecret) {
       const timestamp = Math.floor(Date.now() / 1000).toString();
