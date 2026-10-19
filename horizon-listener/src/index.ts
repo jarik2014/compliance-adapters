@@ -11,6 +11,11 @@ export {
   type RpcEventSourceOptions,
 } from './eventSource';
 export {
+  CursorOutOfRangeError,
+  isCursorOutOfRangeError,
+  extractOldestAvailableLedger,
+} from './errors';
+export {
   InMemoryDeadLetterQueue,
   FileDeadLetterQueue,
   type DeadLetterEvent,

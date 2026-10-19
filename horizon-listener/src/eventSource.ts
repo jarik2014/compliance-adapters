@@ -14,6 +14,12 @@ import { rpc } from '@stellar/stellar-sdk';
  * the rest are intentionally dropped so downstream code isn't coupled to every
  * SDK version's response shape.
  */
+import {
+  CursorOutOfRangeError,
+  extractOldestAvailableLedger,
+  isCursorOutOfRangeError,
+} from './errors';
+
 export interface RawContractEvent {
   /**
    * Opaque, globally-unique event identifier assigned by the Soroban RPC
@@ -68,6 +74,14 @@ export interface EventSource {
      */
     latestLedger?: number;
   }>;
+
+  /**
+   * Re-points the source at a ledger after pruned history forced a restart
+   * (#813). The listener calls this only for `onGap: 'skipToOldest'`; sources
+   * that cannot be restarted omit it, and that mode then fails loudly instead
+   * of silently re-reading a position the node no longer has.
+   */
+  restart?(fromLedger: number): void;
 }
 
 export interface RpcEventSourceOptions {
@@ -97,7 +111,7 @@ type GetEventsRequest = Parameters<rpc.Server['getEvents']>[0];
 type GetEventsResponse = Awaited<ReturnType<rpc.Server['getEvents']>>;
 
 export class RpcEventSource implements EventSource {
-  private readonly options: RpcEventSourceOptions;
+  private options: RpcEventSourceOptions;
   private server: rpc.Server | undefined;
 
   constructor(options: RpcEventSourceOptions) {
@@ -118,9 +132,16 @@ export class RpcEventSource implements EventSource {
     return this.server;
   }
 
-  async getEvents(
-    cursor: string | undefined,
-  ): Promise<{ events: RawContractEvent[]; nextCursor: string }> {
+  /** Re-points the next cursor-less call at a ledger the node still retains (#813). */
+  restart(fromLedger: number): void {
+    this.options = { ...this.options, startLedger: fromLedger };
+  }
+
+  async getEvents(cursor: string | undefined): Promise<{
+    events: RawContractEvent[];
+    nextCursor: string;
+    latestLedger?: number;
+  }> {
     if (!cursor && this.options.startLedger == null) {
       throw new Error(
         'horizon-listener: RpcEventSource requires `startLedger` for the first cursor-less ' +
@@ -143,7 +164,19 @@ export class RpcEventSource implements EventSource {
           }
     ) as GetEventsRequest;
 
-    const getEventsPromise = server.getEvents(request);
+    const getEventsPromise = server.getEvents(request).catch((error: unknown) => {
+      // Pruned history is not retryable: the cursor points at a ledger the node
+      // no longer serves, so retrying it spins forever. Surface it as a typed
+      // error the listener can act on (#813).
+      if (isCursorOutOfRangeError(error)) {
+        throw new CursorOutOfRangeError(
+          cursor ?? this.options.startLedger ?? 'unknown',
+          extractOldestAvailableLedger(error),
+          { cause: error },
+        );
+      }
+      throw error;
+    });
 
     const response: GetEventsResponse = this.options.timeoutMs
       ? await Promise.race([

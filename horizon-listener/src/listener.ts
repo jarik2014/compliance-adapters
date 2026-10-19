@@ -4,6 +4,7 @@
  */
 
 import type { EventSource, RawContractEvent } from './eventSource';
+import { CursorOutOfRangeError, isCursorOutOfRangeError } from './errors';
 import { computeBackoffDelayMs, type BackoffOptions } from '@compliance-adapters/backoff';
 import { type AnyMetricsRegistry, NoopMetricsRegistry } from './metrics';
 import { type AnyTracer, NoopTracer } from './tracing';
@@ -54,6 +55,17 @@ export interface HorizonListenerOptions {
   // latency for high-activity contracts; falls back to pollIntervalMs when
   // a poll returns empty (quiet period).
   mode?: 'poll' | 'stream';
+  /**
+   * What to do when the RPC says our position is outside its retention window
+   * (#813) — the cursor or start ledger points at pruned history.
+   *
+   * - `'fail'` (default): stop and throw `CursorOutOfRangeError`. Retrying a
+   *   position the node no longer has can never succeed, so a generic retry
+   *   loop would spin forever.
+   * - `'skipToOldest'`: restart from the oldest ledger the node still retains
+   *   (requires the source to implement `restart`), accept the gap, and log it.
+   */
+  onGap?: 'fail' | 'skipToOldest';
   /**
    * Optional metrics registry.  Pass a `MetricsRegistry` instance to record
    * per-phase counters and latency histograms.  When omitted (or when a
@@ -108,6 +120,7 @@ export class HorizonListener {
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly backoffOptions: BackoffOptions;
   private readonly mode: 'poll' | 'stream';
+  private readonly onGap: 'fail' | 'skipToOldest';
   private readonly metrics: AnyMetricsRegistry;
   private readonly tracer: AnyTracer;
 
@@ -138,6 +151,7 @@ export class HorizonListener {
     this.backoffOptions = options.backoffOptions ?? {};
     this.backfilling = options.startLedger != null;
     this.mode = options.mode ?? 'poll';
+    this.onGap = options.onGap ?? 'fail';
     this.metrics = options.metrics ?? new NoopMetricsRegistry();
     this.tracer = options.tracer ?? new NoopTracer();
   }
@@ -166,6 +180,42 @@ export class HorizonListener {
         const pollDuration = Date.now() - pollStart;
         this.metrics.counter.inc('rpc_poll', 'failure');
         this.metrics.histogram.observe('rpc_poll', pollDuration);
+
+        // ── pruned history (#813) ────────────────────────────────────────────
+        // Not a transient failure: the position itself no longer exists, so the
+        // backoff-and-retry path below would spin until maxRetries for nothing.
+        if (err instanceof CursorOutOfRangeError || isCursorOutOfRangeError(err)) {
+          const gapError =
+            err instanceof CursorOutOfRangeError
+              ? err
+              : new CursorOutOfRangeError(this.cursor ?? 'unknown', undefined, { cause: err });
+
+          pollSpan.end('error', gapError);
+
+          if (this.onGap === 'skipToOldest' && typeof this.eventSource.restart === 'function') {
+            const resumeFrom = gapError.oldestAvailable;
+            if (typeof resumeFrom === 'number') {
+              this.logger.warn(
+                `horizon-listener: position ${String(gapError.requested)} is outside the RPC ` +
+                  `retention window; skipping to the oldest available ledger ${resumeFrom}. ` +
+                  'Events before that ledger will never be delivered.',
+              );
+              this.cursor = undefined;
+              this.eventSource.restart(resumeFrom);
+              this.attempt = 0;
+              continue;
+            }
+
+            this.logger.error(
+              'horizon-listener: cursor is out of range but the node did not report its oldest ' +
+                'available ledger, so onGap="skipToOldest" cannot resume.',
+            );
+          }
+
+          this.running = false;
+          this.metrics.counter.inc('rpc_poll', 'cancelled');
+          throw gapError;
+        }
 
         this.attempt += 1;
         pollSpan.setAttribute('poll.attempt', this.attempt);
