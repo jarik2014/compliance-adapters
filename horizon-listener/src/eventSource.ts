@@ -58,9 +58,16 @@ export interface RawContractEvent {
 }
 
 export interface EventSource {
-  getEvents(
-    cursor: string | undefined,
-  ): Promise<{ events: RawContractEvent[]; nextCursor: string }>;
+  getEvents(cursor: string | undefined): Promise<{
+    events: RawContractEvent[];
+    nextCursor: string;
+    /**
+     * Chain head reported by the RPC for this poll, when the source knows it.
+     * The listener turns it into the `ledger_lag` gauge (#812); sources that
+     * cannot report it simply omit the field.
+     */
+    latestLedger?: number;
+  }>;
 }
 
 export interface RpcEventSourceOptions {
@@ -170,6 +177,13 @@ export class RpcEventSource implements EventSource {
     const nextCursor =
       responseCursor ?? (events.length > 0 ? events[events.length - 1].id : (cursor ?? ''));
 
-    return { events, nextCursor };
+    // Soroban RPC returns the current chain head with every getEvents response.
+    const latestLedger = (response as unknown as { latestLedger?: number }).latestLedger;
+
+    return {
+      events,
+      nextCursor,
+      ...(typeof latestLedger === 'number' ? { latestLedger } : {}),
+    };
   }
 }

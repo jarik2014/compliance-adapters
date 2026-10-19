@@ -29,6 +29,18 @@ export interface Counter<Phase extends string> {
 }
 
 /**
+ * A gauge: a value that can go up and down, read at scrape time.
+ *
+ * Counters and histograms in this package are keyed by `phase`; gauges are
+ * keyed by name because they describe a state (e.g. how far behind the chain
+ * head the listener is), not a call.
+ */
+export interface Gauge {
+  set(name: string, value: number): void;
+  get(name: string): number | undefined;
+}
+
+/**
  * A histogram that tracks duration samples in configurable buckets (ms).
  * Exposes `count`, `sum`, and per-bucket cumulative counts for Prometheus.
  */
@@ -102,7 +114,28 @@ class DefaultHistogram<Phase extends string> implements Histogram<Phase> {
   }
 }
 
+// ── Gauge implementation ─────────────────────────────────────────────────────
+
+class DefaultGauge implements Gauge {
+  private readonly values = new Map<string, number>();
+
+  set(name: string, value: number): void {
+    this.values.set(name, value);
+  }
+
+  get(name: string): number | undefined {
+    return this.values.get(name);
+  }
+}
+
 // ── No-op implementations (disabled metrics) ─────────────────────────────────
+
+class NoopGauge implements Gauge {
+  set(_name: string, _value: number): void {}
+  get(_name: string): number | undefined {
+    return undefined;
+  }
+}
 
 class NoopCounter<Phase extends string> implements Counter<Phase> {
   inc(_phase: Phase, _outcome: Outcome): void {}
@@ -127,6 +160,11 @@ export interface MetricsRegistryOptions<Phase extends string> {
   prefix: string;
   /** Custom histogram bucket boundaries in milliseconds. */
   histogramBuckets?: number[];
+  /**
+   * Gauge names this registry may publish (e.g. `ledger_lag`). Declared up front
+   * so `expose()` can emit a HELP/TYPE line per gauge; unset gauges are skipped.
+   */
+  gauges?: string[];
 }
 
 /**
@@ -138,14 +176,18 @@ export interface MetricsRegistryOptions<Phase extends string> {
 export class MetricsRegistry<Phase extends string> {
   readonly counter: Counter<Phase>;
   readonly histogram: Histogram<Phase>;
+  readonly gauge: Gauge;
   private readonly prefix: string;
   private readonly phases: Phase[];
+  private readonly gaugeNames: string[];
 
   constructor(options: MetricsRegistryOptions<Phase>) {
     this.prefix = options.prefix;
     this.phases = options.phases;
+    this.gaugeNames = options.gauges ?? [];
     this.counter = new DefaultCounter<Phase>();
     this.histogram = new DefaultHistogram<Phase>(options.histogramBuckets);
+    this.gauge = new DefaultGauge();
   }
 
   /**
@@ -194,6 +236,18 @@ export class MetricsRegistry<Phase extends string> {
       lines.push(`${histName}_count{phase="${phase}"} ${count}`);
     }
 
+    // ── Gauges ───────────────────────────────────────────────────────────────
+    // Only gauges that have been set are exposed: Prometheus would otherwise
+    // report a phantom zero for a state the process never measured.
+    for (const name of this.gaugeNames ?? []) {
+      const value = this.gauge.get(name);
+      if (value === undefined) continue;
+      const gaugeName = name.startsWith(this.prefix) ? name : `${this.prefix}_${name}`;
+      lines.push(`# HELP ${gaugeName} Gauge reported by ${this.prefix}`);
+      lines.push(`# TYPE ${gaugeName} gauge`);
+      lines.push(`${gaugeName} ${value}`);
+    }
+
     return lines.join('\n') + '\n';
   }
 }
@@ -207,6 +261,7 @@ export class MetricsRegistry<Phase extends string> {
 export class NoopMetricsRegistry<Phase extends string> {
   readonly counter: Counter<Phase> = new NoopCounter<Phase>();
   readonly histogram: Histogram<Phase> = new NoopHistogram<Phase>();
+  readonly gauge: Gauge = new NoopGauge();
 
   expose(): string {
     return '';

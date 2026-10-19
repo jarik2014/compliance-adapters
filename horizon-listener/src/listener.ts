@@ -112,6 +112,8 @@ export class HorizonListener {
   private readonly tracer: AnyTracer;
 
   private cursor: string | undefined;
+  /** Highest ledger we have successfully relayed; basis for the ledger-lag gauge. */
+  private processedLedger: number | undefined;
   private running = false;
   private attempt = 0;
   private backfilling = false;
@@ -156,7 +158,7 @@ export class HorizonListener {
       const pollSpan = this.tracer.startSpan('rpc_poll');
       pollSpan.setAttribute('poll.attempt', this.attempt);
 
-      let response: { events: RawContractEvent[]; nextCursor: string };
+      let response: { events: RawContractEvent[]; nextCursor: string; latestLedger?: number };
       const pollStart = Date.now();
       try {
         response = await this.eventSource.getEvents(this.cursor);
@@ -253,6 +255,9 @@ export class HorizonListener {
           const relayDuration = Date.now() - relayStart;
           this.metrics.counter.inc('event_relay', 'success');
           this.metrics.histogram.observe('event_relay', relayDuration);
+          // Only successfully relayed ledgers count as progress; a failed event
+          // must keep the lag honest.
+          this.processedLedger = event.ledger;
           relaySpan.end('ok');
         } else {
           const relayDuration = Date.now() - relayStart;
@@ -271,6 +276,18 @@ export class HorizonListener {
             }
           }
         }
+      }
+
+      // ── ledger lag (#812) ─────────────────────────────────────────────────
+      // Measured after the batch is relayed, so the number answers "how far
+      // behind the chain head are we now" rather than one poll late. Events we
+      // have not seen yet are compliance gaps, which makes this the pipeline's
+      // main SLO signal. Sources without `latestLedger` leave the gauge alone.
+      if (typeof response.latestLedger === 'number') {
+        const processed = this.processedLedger;
+        const lag =
+          typeof processed === 'number' ? Math.max(0, response.latestLedger - processed) : 0;
+        this.metrics.gauge.set('ledger_lag', lag);
       }
 
       this.cursor = response.nextCursor;

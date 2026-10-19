@@ -19,13 +19,14 @@ import {
   NoopMetricsRegistry as GenericNoopMetricsRegistry,
   DEFAULT_HISTOGRAM_BUCKETS,
   type Counter,
+  type Gauge,
   type Histogram,
   type Outcome,
   type MetricsRegistryOptions as GenericMetricsRegistryOptions,
 } from '@compliance-adapters/metrics';
 
 export { DEFAULT_HISTOGRAM_BUCKETS };
-export type { Counter, Histogram, Outcome };
+export type { Counter, Gauge, Histogram, Outcome };
 
 export type Phase = 'rpc_poll' | 'event_relay' | 'webhook';
 
@@ -48,7 +49,14 @@ export type MetricsRegistryOptions = Omit<
  */
 export class MetricsRegistry extends GenericMetricsRegistry<Phase> {
   constructor(options: MetricsRegistryOptions = {}) {
-    super({ ...options, prefix: options.prefix ?? 'horizon_listener', phases: PHASES });
+    super({
+      ...options,
+      prefix: options.prefix ?? 'horizon_listener',
+      phases: PHASES,
+      // Gauges are state, not per-call samples: `ledger_lag` is how far behind
+      // the RPC's chain head the last poll was (#812).
+      gauges: options.gauges ?? ['ledger_lag'],
+    });
   }
 }
 

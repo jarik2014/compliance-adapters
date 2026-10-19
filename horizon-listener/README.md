@@ -392,6 +392,26 @@ Each phase carries a low-cardinality `outcome` label:
 - `failure` — the phase returned an error or failed a request
 - `cancelled` — a poll was abandoned because the listener hit `maxRetries`
 
+### Ledger lag gauge
+
+Besides per-call counters and histograms the registry exposes one gauge:
+
+- `${prefix}_ledger_lag` — how far behind the RPC's chain head the listener was
+  after the last poll (`latestLedger` from the response minus the highest ledger
+  that was successfully relayed).
+
+It is the main SLO signal for a compliance pipeline: events the listener has not
+seen yet are compliance gaps, not just latency. The value is `0` on the first
+poll (nothing has been relayed yet) and is never negative. Sources that do not
+report `latestLedger` leave the gauge unset, and an unset gauge is omitted from
+`expose()` rather than reported as a phantom zero.
+
+```text
+# HELP horizon_listener_ledger_lag Gauge reported by horizon_listener
+# TYPE horizon_listener_ledger_lag gauge
+horizon_listener_ledger_lag 3
+```
+
 The exported metric names are prefixed with the value from `prefix` (default:
 `horizon_listener`):
 
